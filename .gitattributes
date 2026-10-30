@@ -1,0 +1,8 @@
+# Scripts executed by a POSIX shell or through a shebang must keep LF line endings.
+# A CRLF checkout turns "#!/bin/sh" into "#!/bin/sh\r" and fails with "bad interpreter".
+*.sh                text eol=lf
+git-push-remotes    text eol=lf
+git-push-remotes.py text eol=lf
+# Windows batch files must keep CRLF.
+*.bat               text eol=crlf
+*.cmd               text eol=crlf
