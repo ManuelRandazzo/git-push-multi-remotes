@@ -1,0 +1,289 @@
+#!/usr/bin/env python3
+
+import git # Reference: https://www.geeksforgeeks.org/python/automating-some-git-commands-with-python/
+import argparse
+import re
+import subprocess
+import sys
+
+VERSION_MAJOR = 1
+VERSION_MINOR = 0
+VERSION_PATCH = 0
+
+# ANSI color codes
+BOLD_RED = '\033[1;31m'
+BOLD_YELLOW = '\033[1;33m'
+BOLD_GREEN = '\033[1;32m'
+RED = '\033[0;31m'
+YELLOW = '\033[0;33m'
+GREEN = '\033[0;32m'
+NC = '\033[0m'
+
+# 'git push' options that take their value as a separate argument (e.g. '-o ci.skip').
+# Options with an optional value (--force-with-lease, --signed) must be written with '=',
+# exactly like in 'git push'. Check 'git push -h' for the full list of options.
+GIT_PUSH_VALUE_OPTS = {'-o', '--push-option', '--receive-pack', '--exec', '--repo', '--recurse-submodules'}
+
+# Short 'git push' flags that take no value and can be bundled (e.g. -fu).
+GIT_PUSH_FLAG_LETTERS = 'fnquvd46'
+
+# With these 'git push' options the branch is optional (git itself validates the combinations).
+GIT_PUSH_NO_BRANCH_OPTS = ('--all', '--branches', '--mirror', '--tags')
+
+
+def has_opt(opts, long_name, short=None):
+    """True if the 'git push' option (long form, or short flag possibly bundled) is in opts."""
+    for opt in opts:
+        if opt == long_name or opt.startswith(long_name + '='):
+            return True
+        if short and re.fullmatch('-[' + GIT_PUSH_FLAG_LETTERS + ']+', opt) and short in opt:
+            return True
+    return False
+
+
+def split_args(argv, own_opts, own_short_letters):
+    """Separates the options of this script from the options meant for 'git push'.
+
+    Anything that starts with '-' and is not an option of this script is handed over to
+    'git push' untouched (together with its value for the options in GIT_PUSH_VALUE_OPTS),
+    so it never gets mistaken for the branch name.
+    """
+    own, git_opts = [], []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == '--':
+            own.extend(argv[i:])
+            break
+        if arg.startswith('-') and arg != '-':
+            name = arg.split('=', 1)[0]
+            own_bundle = not arg.startswith('--') and len(arg) > 2 and set(arg[1:]) <= own_short_letters # e.g. -ra
+            if name in own_opts or own_bundle:
+                own.append(arg)
+            else:
+                git_opts.append(arg)
+                if name in GIT_PUSH_VALUE_OPTS and '=' not in arg and i + 1 < len(argv):
+                    i += 1
+                    git_opts.append(argv[i])
+        else:
+            own.append(arg)
+        i += 1
+    return own, git_opts
+
+
+def print_git_push_help():
+    """Prints the options of 'git push' (the output of 'git push -h'). It works outside a repository too."""
+    print(f'{GREEN}\nOptions of git push (git push -h):{NC}')
+    sys.stdout.flush()
+    try:
+        subprocess.run(['git', 'push', '-h']) # 'git push -h' exits with 129 by design, so the exit code is ignored
+    except FileNotFoundError:
+        print(f'{BOLD_RED}ERROR:{NC}{RED} the \'git\' executable was not found in PATH.{NC}')
+        sys.exit(1)
+    print('')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+        description='Pushes a branch to all the remotes of a repository. '
+                    'Every option of \'git push\' can be used too (see: git push -h, or git push-remotes -ls --push), '
+                    'e.g.: git push-remotes --force <branch>',
+        allow_abbrev=False
+    )
+
+    # Prints the script version.
+    parser.add_argument(
+        '--version', '-V', action='store_true',
+        help='prints the script version.'
+    )
+    
+    # List branches and remotes with the '-ls' (list) command.
+    parser.add_argument(
+        '--list', '-ls', action='store_true',
+        help='list branches, remotes or the options of git push. Requires at least one of -r, -a, -L, -R, --push. Cannot be combined with a branch, --exclude-remotes or git push options.'
+    )
+
+    # Add options for the '-ls' (list) command.
+    cmd_list_group = parser.add_argument_group('options for --list, -ls')
+
+    # List the names of all registered remotes in the repository.
+    cmd_list_group.add_argument(
+        '--remotes', '-r', action='store_true',
+        help='list the names of all registered remotes in the repository.'
+    )
+
+    # List all local and remote branches.
+    cmd_list_group.add_argument(
+        '--all-branches', '-a', action='store_true',
+        help='list all local and remote branches.'
+    )
+
+    # List all local branches.
+    cmd_list_group.add_argument(
+        '--local-branches', '-L', action='store_true',
+        help='list all local branches'
+    )
+
+    # List all remote branches.
+    cmd_list_group.add_argument(
+        '--remote-branches', '-R', action='store_true',
+        help='list all remote branches'
+    )
+
+    # List the options of 'git push' (the output of 'git push -h').
+    cmd_list_group.add_argument(
+        '--push', action='store_true',
+        help='list the options of git push (the output of git push -h). Every one of them can be used with git push-remotes.'
+    )
+
+    # Selects the path to a local repository
+    parser.add_argument(
+        '--set-local-path', '--path', nargs='?', default='./',
+        help='selects the path to a local repository and prompts the user to choose where to install the configuration folder: inside the repository or in a custom directory. If a custom location is chosen, the user must specify the target directory. ' + BOLD_YELLOW + 'WARNING: ' + NC +'When installing inside the repository, the script offers to add the configuration folder to .gitignore (recommended) to prevent its contents, including references to remote repositories, from being tracked by Git.'
+    )
+
+    # Select the branch name (string) in which to push the changes.
+    parser.add_argument(
+        'branch', nargs='?',
+        help='select the branch name in which to push the changes. Pushes to the remotes if the branch exists, otherwise, exit with an error.'
+    )
+
+    # Excludes one or more remotes.
+    parser.add_argument(
+        '--exclude-remotes', '-x', nargs='+', default=None,
+        help='excludes one or more remotes. In case of more remotes it is required to separate them with spaces: e.g. --exclude-remotes origin github codeberg gitlab gitea gitee'
+    )
+
+    # The options of this script are read from the parser itself, so they can never get out of sync.
+    own_opts = {opt for action in parser._actions for opt in action.option_strings}
+    own_short_letters = {o[1] for o in own_opts if len(o) == 2 and o[1] not in '-x'}
+
+    # Everything that is not an option of this script is meant for 'git push'.
+    own_argv, git_opts = split_args(sys.argv[1:], own_opts, own_short_letters)
+    args = parser.parse_args(own_argv)
+    
+    # List options validation and eventual error
+    listing_opts = (args.remotes, args.all_branches, args.local_branches, args.remote_branches, args.push)
+    if args.list:
+        if not any(listing_opts):
+            parser.error('-ls requires at least one of: --remotes, --all-branches, --local-branches, --remote-branches, --push')
+        if args.branch or args.exclude_remotes or git_opts:
+            parser.error('-ls cannot be combined with a branch, --exclude-remotes or git push options')
+    elif any(listing_opts):
+        parser.error('--remotes, --all-branches, --local-branches, --remote-branches, --push require -ls')
+
+    if has_opt(git_opts, '--repo'):
+        parser.error('--repo cannot be used: the remotes are chosen by git push-remotes (use --exclude-remotes to skip some)')
+
+    if args.version:
+        VERSION = f'{VERSION_MAJOR}.{VERSION_MINOR}.{VERSION_PATCH}'
+        print(VERSION)
+        sys.exit(0)
+        
+    # '-ls --push' alone does not need a repository so exit faster by skipping some commands
+    if args.list and args.push and not any(listing_opts[:4]):
+        print_git_push_help()
+        sys.exit(0)
+
+    try: # User defined local path or assumes the repo is in the directory of the local repository
+        repo = git.Repo(args.set_local_path)
+    except (git.InvalidGitRepositoryError, git.NoSuchPathError):
+        print(f'{BOLD_RED}ERROR:{NC}{RED} \'{args.set_local_path}\' is an invalid path, please retry.{NC}')
+        sys.exit(1)
+    
+    print(f'{BOLD_GREEN}\nUsing local repository:{NC}{GREEN} {repo.working_tree_dir}{NC}')
+
+    # List command and subcommands
+    if args.list:
+        # Get the names of all remotes
+        if args.remotes:
+            print(f'{GREEN}\nRemote names:{NC}')
+            for remote in repo.remotes:
+                print(remote.name)
+            print('')
+
+        # Get the names of all local branches
+        if args.local_branches or args.all_branches:
+            print(f'{GREEN}\nLocal repo branches:{NC}')
+            for branch in repo.heads:
+                print(branch.name)
+            print('')
+
+        # Get the names of all remote branches
+        if args.remote_branches or args.all_branches:
+            remote_branches_list = [ref.name for remote in repo.remotes for ref in remote.refs]
+            print(f'{GREEN}\nRemote repos branches:{NC}')
+            for remote_branch_name in remote_branches_list:
+                print(remote_branch_name)
+            print('')
+
+        # Get the options of 'git push'
+        if args.push:
+            print_git_push_help()
+        
+        sys.exit(0)
+
+    branch_is_optional = any(has_opt(git_opts, opt) for opt in GIT_PUSH_NO_BRANCH_OPTS)
+    deleting = has_opt(git_opts, '--delete', 'd')
+
+    if not args.branch and not branch_is_optional:
+        print(f'{BOLD_RED}ERROR:{NC}{RED} If you want to push changes to remotes you must specify the branch.{NC}')
+        sys.exit(1)
+    
+    # When deleting, the branch may exist only on the remotes, so it is not required locally.
+    if args.branch and not deleting and args.branch not in [branch.name for branch in repo.heads]:
+        print(f'{BOLD_RED}ERROR:{NC}{RED} This branch does not exist, check for typos.{NC}')
+        sys.exit(1)
+
+    if args.branch and not deleting and repo.head.is_detached:
+        print(f'{BOLD_YELLOW} WARNING:{NC}{YELLOW} \'HEAD\' is detached, do you want to push anyway? [y/n]{NC}')
+        ans = input().strip().lower()
+        if ans != 'y':
+            print(f'{BOLD_YELLOW} WARNING:{NC}{YELLOW} Push has been aborted by the User due to detached \'HEAD\'.{NC}')
+            sys.exit(1)
+
+    all_remotes_names_list = [remote.name for remote in repo.remotes]
+    exclude_remote_list = args.exclude_remotes or []
+    invalid_remotes = [name for name in exclude_remote_list if name not in all_remotes_names_list]
+
+    # Check whether some excluded remotes don't even exist (for example caused by typos)
+    if invalid_remotes:
+        print(f'{BOLD_RED}ERROR:{NC}{RED} Unknown remote(s): {", ".join(invalid_remotes)}{NC}')
+        sys.exit(1) 
+
+    final_remotes_names_list = [name for name in all_remotes_names_list if name not in exclude_remote_list]
+
+    # Check whether all remotes have been excluded or no remotes exist.
+    if not final_remotes_names_list:
+        print(f'{BOLD_RED}ERROR:{NC}{RED} No remotes available for pushing. All remotes may have been excluded, or no remotes are configured.{NC}')
+        sys.exit(1)
+
+    if len(final_remotes_names_list) > 1 and has_opt(git_opts, '--set-upstream', 'u'):
+        print(f'{BOLD_YELLOW} WARNING:{NC}{YELLOW} --set-upstream is applied to every remote in turn: the upstream will end up on the last one pushed.{NC}')
+
+    # Final push: runs the real 'git push' for each remote, so every option behaves exactly as in git.
+    workdir = repo.working_tree_dir or repo.git_dir
+    try:
+        for position, remote_name in enumerate(final_remotes_names_list):
+            command = ['git', '-C', workdir, 'push', *git_opts, remote_name]
+            if args.branch:
+                command.append(args.branch)
+
+            print(f'{BOLD_GREEN}\n==> Pushing to {remote_name}{NC}')
+            sys.stdout.flush()
+            result = subprocess.run(command)
+
+            if result.returncode != 0:
+                print(f'{BOLD_RED}Push failed to {remote_name} (git exit code {result.returncode}).{NC}')
+                not_attempted = final_remotes_names_list[position + 1:]
+                if not_attempted:
+                    print(f'{YELLOW}Not attempted: {", ".join(not_attempted)}{NC}')
+                sys.exit(1)
+    except FileNotFoundError:
+        print(f'{BOLD_RED}ERROR:{NC}{RED} the \'git\' executable was not found in PATH.{NC}')
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print(f'{BOLD_YELLOW}\n WARNING:{NC}{YELLOW} Interrupted by the User.{NC}')
+        sys.exit(130)
+                
+    sys.exit(0)
